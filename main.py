@@ -16,6 +16,7 @@ from src.etl.runner import BooksToScrapeAutoRepairRunner
 from src.etl.validator.books import BooksPayloadValidator
 from src.notification.mock_email import MockEmailNotifier
 from src.repair.demo_breaker import CodexDemoBreaker
+from src.repair.source_auditor import CodexSourceAuditor
 from src.utils import write_text
 
 logger.configure(handlers=[{"sink": sys.stdout, "level": "INFO"}])
@@ -174,6 +175,39 @@ def llm_break_demo(diagnostics_dir: str, break_timeout: int, break_command: str 
             break_command=break_command,
         )
         breaker.run()
+    except Exception as exc:
+        print(json.dumps({"status": "failed", "error": repr(exc)}, indent=2), file=sys.stderr)
+        sys.exit(1)
+
+
+@main.command("source-audit")
+@click.option("--diagnostics-dir", default="diagnostics/source-audit")
+@click.option("--audit-timeout", default=900, type=int)
+@click.option("--audit-command", default=None)
+@click.option("--source-url", default=general_settings.source_url)
+@click.option("--browser", type=click.Choice(["auto", "camoufox", "playwright"]), default="playwright")
+@click.option("--fix", is_flag=True, help="Allow Codex to patch scraper code if source drift is found.")
+@click.option("--credentials", nargs=2, metavar="LOGIN PASSWORD", default=None)
+def source_audit(
+    diagnostics_dir: str,
+    audit_timeout: int,
+    audit_command: str | None,
+    source_url: str,
+    browser: str,
+    fix: bool,
+    credentials: tuple[str, str] | None,
+):
+    try:
+        auditor = CodexSourceAuditor(
+            diagnostics_dir=Path(diagnostics_dir),
+            timeout=audit_timeout,
+            source_url=source_url,
+            browser=browser,
+            fix=fix,
+            credentials=credentials,
+            audit_command=audit_command,
+        )
+        auditor.run()
     except Exception as exc:
         print(json.dumps({"status": "failed", "error": repr(exc)}, indent=2), file=sys.stderr)
         sys.exit(1)

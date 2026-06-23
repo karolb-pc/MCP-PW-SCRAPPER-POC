@@ -39,6 +39,8 @@ main.py
   +--> break-selector-demo
   |
   +--> llm-break-demo
+  |
+  +--> source-audit
 ```
 
 The normal ETL output is:
@@ -103,6 +105,9 @@ src/repair/codex.py
 
 src/repair/demo_breaker.py
   Runs codex exec to intentionally introduce one realistic scraper bug for self-repair demos.
+
+src/repair/source_auditor.py
+  Runs codex exec for proactive source inspection and optional source-drift fixes.
 ```
 
 ## 4. Normal Scraping Flow
@@ -225,7 +230,7 @@ BooksToScrapeAutoRepairRunner
               CodexRepairAgent
               codex exec
               codex_repair.log
-              retry ETL
+              retry ETL in a fresh Python subprocess
 ```
 
 Default repair settings:
@@ -266,6 +271,8 @@ etl_attempt_failed
 notification_sent
 repair_attempt_started
 repair_attempt_finished
+fresh_retry_subprocess_started
+fresh_retry_subprocess_finished
 repair_report_succeeded
 repair_report_failed
 ```
@@ -367,7 +374,53 @@ notifications/llm-self-fix/*.txt
 
 This scenario is not tied to a single hardcoded break. The first LLM introduces a realistic scraper drift, and the repair LLM must identify the cause from diagnostics, current HTML, and the data contract.
 
-## 11. Failure Simulation
+## 11. Proactive Source Audit
+
+`source-audit` is an explicit command that lets the system inspect the live source before a regular scraper failure occurs.
+
+Inspect-only mode:
+
+```bash
+uv run python main.py source-audit \
+  --diagnostics-dir diagnostics/source-audit \
+  --browser playwright
+```
+
+Inspect-and-fix mode:
+
+```bash
+uv run python main.py source-audit \
+  --fix \
+  --diagnostics-dir diagnostics/source-audit-fix \
+  --browser playwright
+```
+
+The command writes:
+
+```text
+diagnostics/source-audit*/source_audit_report.json
+diagnostics/source-audit*/source_audit_prompt.md
+diagnostics/source-audit*/source_audit.log
+diagnostics/source-audit*/source_audit_fresh_verification.log
+```
+
+With `--fix`, source audit performs a fresh subprocess verification after Codex exits, so patched scraper files are imported from disk before the command reports success.
+
+It asks Codex to inspect the live source URL, analyze HTML/DOM, compare the page with scraper code in `src/etl/extractor/books.py` and `src/etl/transformer/books.py`, and optionally patch minimal scraper code when `--fix` is provided.
+
+Optional credentials can be passed with:
+
+```bash
+uv run python main.py source-audit \
+  --fix \
+  --source-url https://example.com/private/catalog \
+  --credentials "login@example.com" "password-value" \
+  --diagnostics-dir diagnostics/private-source-audit
+```
+
+Credentials are passed to the Codex subprocess through stdin. Saved prompts, logs, and reports redact credential values.
+
+## 12. Failure Simulation
 
 The `run` command supports simulated failures:
 
@@ -391,7 +444,7 @@ uv run python main.py run --quiet --auto-repair \
 
 These modes are good for testing diagnostics and notifications. They are not good for testing successful self-repair because the simulated failure is injected on every retry.
 
-## 12. Commands
+## 13. Commands
 
 Normal run:
 
@@ -429,7 +482,19 @@ Run LLM break demo:
 uv run python main.py llm-break-demo --diagnostics-dir diagnostics/llm-break-demo
 ```
 
-## 13. Docker
+Run proactive source audit:
+
+```bash
+uv run python main.py source-audit --diagnostics-dir diagnostics/source-audit
+```
+
+Run proactive source audit with fixes enabled:
+
+```bash
+uv run python main.py source-audit --fix --diagnostics-dir diagnostics/source-audit-fix
+```
+
+## 14. Docker
 
 The Dockerfile uses:
 
@@ -452,7 +517,7 @@ docker build -t mcp-pw-scrapper .
 docker run --rm mcp-pw-scrapper
 ```
 
-## 14. Implemented
+## 15. Implemented
 
 - layered ETL architecture;
 - Click CLI;
@@ -467,10 +532,11 @@ docker run --rm mcp-pw-scrapper
 - structured `repair_report.json`;
 - deterministic selector-break demo;
 - LLM-generated scraper-break demo;
+- proactive source audit command;
 - retry-based self-repair;
 - Dockerfile.
 
-## 15. Not Implemented Yet
+## 16. Not Implemented Yet
 
 - real GCS loader;
 - real BigQuery loader;

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -45,17 +48,27 @@ class BooksToScrapeAutoRepairRunner:
         )
 
         for attempt in range(self.repair_attempts + 1):
-            etl = BooksToScrapeETL(config=CONFIG)
             report.record("etl_attempt_started", attempt=attempt + 1)
             try:
-                payload = await etl.run(
-                    browser_mode=browser_mode,
-                    output_path=output_path,
-                    export_dir=export_dir,
-                    diagnostics_dir=diagnostics_dir,
-                    simulate_failure=simulate_failure,
-                    quiet=quiet,
-                )
+                if repair_was_attempted:
+                    payload = self._run_fresh_etl_subprocess(
+                        browser_mode=browser_mode,
+                        output_path=output_path,
+                        export_dir=export_dir,
+                        diagnostics_dir=diagnostics_dir,
+                        simulate_failure=simulate_failure,
+                        report=report,
+                    )
+                else:
+                    etl = BooksToScrapeETL(config=CONFIG)
+                    payload = await etl.run(
+                        browser_mode=browser_mode,
+                        output_path=output_path,
+                        export_dir=export_dir,
+                        diagnostics_dir=diagnostics_dir,
+                        simulate_failure=simulate_failure,
+                        quiet=quiet,
+                    )
                 if repair_was_attempted:
                     notification_path = self.notifier.send(
                         subject="[MCP-PW-SCRAPPER] Scraper recovered after repair",
@@ -215,3 +228,51 @@ class BooksToScrapeAutoRepairRunner:
             error=repr(last_error),
         )
         raise last_error
+
+    def _run_fresh_etl_subprocess(
+        self,
+        browser_mode: str,
+        output_path: Path,
+        export_dir: Path | None,
+        diagnostics_dir: Path,
+        simulate_failure: str,
+        report: RepairReport,
+    ) -> dict[str, Any]:
+        command = [
+            sys.executable,
+            "main.py",
+            "run",
+            "--quiet",
+            "--browser",
+            browser_mode,
+            "--output",
+            str(output_path),
+            "--diagnostics-dir",
+            str(diagnostics_dir),
+            "--simulate-failure",
+            simulate_failure,
+        ]
+        if export_dir is not None:
+            command.extend(["--export-dir", str(export_dir)])
+
+        report.record("fresh_retry_subprocess_started", command=command)
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            cwd=Path.cwd(),
+            check=False,
+        )
+        report.record(
+            "fresh_retry_subprocess_finished",
+            returncode=completed.returncode,
+            stdout_chars=len(completed.stdout),
+            stderr_chars=len(completed.stderr),
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "Fresh retry subprocess failed after repair.\n"
+                f"stdout:\n{completed.stdout}\n"
+                f"stderr:\n{completed.stderr}"
+            )
+        return json.loads(output_path.read_text())

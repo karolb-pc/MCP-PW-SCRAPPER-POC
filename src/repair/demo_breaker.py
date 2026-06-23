@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from src.repair.process_runner import run_logged_process
 from src.utils import write_json, write_text
 
 
@@ -43,59 +44,33 @@ class CodexDemoBreaker:
         )
 
         try:
-            completed = subprocess.run(
-                command,
-                input=prompt,
-                text=True,
-                capture_output=True,
-                cwd=Path.cwd(),
-                check=False,
+            completed = run_logged_process(
+                command=command,
+                input_text=prompt,
+                log_path=log_path,
                 timeout=self.timeout,
+                status_prefix="llm_break",
             )
-        except subprocess.TimeoutExpired as exc:
-            write_text(
-                log_path,
-                "\n".join(
-                    [
-                        "$ " + " ".join(shlex.quote(part) for part in command),
-                        "",
-                        f"LLM break timed out after {self.timeout} seconds.",
-                        "",
-                        "## stdout",
-                        exc.stdout or "",
-                        "",
-                        "## stderr",
-                        exc.stderr or "",
-                    ]
-                ),
-            )
-            self._record("llm_break_timeout", timeout=self.timeout)
-            raise RuntimeError(f"LLM break timed out. See {log_path}.") from exc
-
-        write_text(
-            log_path,
-            "\n".join(
-                [
-                    "$ " + " ".join(shlex.quote(part) for part in command),
-                    "",
-                    "## stdout",
-                    completed.stdout,
-                    "",
-                    "## stderr",
-                    completed.stderr,
-                    "",
-                    f"## returncode\n{completed.returncode}\n",
-                ]
-            ),
-        )
+        except Exception as exc:
+            if exc.__class__.__name__ == "TimeoutExpired":
+                self._record("llm_break_timeout", timeout=self.timeout)
+                raise RuntimeError(f"LLM break timed out. See {log_path}.") from exc
+            self._record("llm_break_failed_before_finish", error=repr(exc))
+            raise
 
         changed_project_files = self._changed_project_files(before)
+        scraper_diff = self._scraper_diff()
+        summary_path = self.diagnostics_dir / "llm_break_summary.md"
+        write_text(summary_path, self._build_summary(changed_project_files, scraper_diff))
         self._record(
             "llm_break_finished",
             returncode=completed.returncode,
             stdout_chars=len(completed.stdout),
             stderr_chars=len(completed.stderr),
+            elapsed_seconds=round(completed.elapsed_seconds, 1),
             changed_project_files=changed_project_files,
+            summary=str(summary_path),
+            scraper_diff=scraper_diff,
         )
 
         if completed.returncode != 0:
@@ -166,6 +141,39 @@ In your final response, summarize:
 - what kind of realistic scraper drift you introduced
 - compile verification result
 """
+
+    @staticmethod
+    def _scraper_diff() -> str:
+        completed = subprocess.run(
+            ["git", "diff", "--", "src/etl/extractor", "src/etl/transformer"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            return ""
+        return completed.stdout
+
+    @staticmethod
+    def _build_summary(changed_project_files: list[str], scraper_diff: str) -> str:
+        changed = "\n".join(f"- {path}" for path in changed_project_files) or "- none"
+        diff = scraper_diff.strip() or "No scraper diff was available."
+        return "\n".join(
+            [
+                "# LLM Break Summary",
+                "",
+                "## Changed Files",
+                "",
+                changed,
+                "",
+                "## Scraper Diff",
+                "",
+                "```diff",
+                diff,
+                "```",
+                "",
+            ]
+        )
 
     @staticmethod
     def _project_file_hashes() -> dict[str, str]:

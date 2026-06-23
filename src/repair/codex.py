@@ -9,7 +9,7 @@ import hashlib
 from pathlib import Path
 
 from src.notification.mock_email import MockEmailNotifier
-from src.utils import write_text
+from src.repair.process_runner import run_logged_process
 
 
 class CodexRepairAgent:
@@ -60,50 +60,19 @@ class CodexRepairAgent:
         )
 
         try:
-            completed = subprocess.run(
-                command,
-                input=prompt,
-                text=True,
-                capture_output=True,
-                cwd=Path.cwd(),
-                check=False,
+            completed = run_logged_process(
+                command=command,
+                input_text=prompt,
+                log_path=log_path,
                 timeout=self.repair_timeout,
+                status_prefix="codex_repair",
             )
-        except subprocess.TimeoutExpired as exc:
-            write_text(
-                log_path,
-                "\n".join(
-                    [
-                        "$ " + " ".join(shlex.quote(part) for part in command),
-                        "",
-                        f"Repair timed out after {self.repair_timeout} seconds.",
-                        "",
-                        "## stdout",
-                        exc.stdout or "",
-                        "",
-                        "## stderr",
-                        exc.stderr or "",
-                    ]
-                ),
-            )
+        except TimeoutError as exc:
             raise RuntimeError(f"Repair agent timed out. See {log_path}.") from exc
-
-        write_text(
-            log_path,
-            "\n".join(
-                [
-                    "$ " + " ".join(shlex.quote(part) for part in command),
-                    "",
-                    "## stdout",
-                    completed.stdout,
-                    "",
-                    "## stderr",
-                    completed.stderr,
-                    "",
-                    f"## returncode\n{completed.returncode}\n",
-                ]
-            ),
-        )
+        except Exception as exc:
+            if exc.__class__.__name__ == "TimeoutExpired":
+                raise RuntimeError(f"Repair agent timed out. See {log_path}.") from exc
+            raise
 
         if completed.returncode != 0:
             raise RuntimeError(
@@ -128,6 +97,7 @@ class CodexRepairAgent:
             "returncode": completed.returncode,
             "stdout_chars": len(completed.stdout),
             "stderr_chars": len(completed.stderr),
+            "elapsed_seconds": round(completed.elapsed_seconds, 1),
             "changed_files_before_repair": changed_files_before,
             "changed_files_after_repair": changed_files_after,
             "changed_project_files": changed_project_files,
