@@ -3,8 +3,12 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 *.pyc
+.env
 output/
 data/
 diagnostics/
 notifications/
 instrukcje/
+.playwright-mcp/
+scrapers/discovery/*
+!scrapers/discovery/.gitkeep

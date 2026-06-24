@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import json
 import re
-import sys
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from src.agents.terminal import emit_status
 from src.utils import utc_timestamp_with_microseconds, write_text
 
 
@@ -42,16 +42,5 @@ class MockEmailNotifier:
             ]
         )
         write_text(path, content)
-        print(
-            json.dumps(
-                {
-                    "status": "mock_email_sent",
-                    "to": self.recipient,
-                    "subject": subject,
-                    "path": str(path),
-                },
-                indent=2,
-            ),
-            file=sys.stderr,
-        )
+        emit_status("notification", f"sent to={self.recipient} subject={subject!r} path={path}")
         return path

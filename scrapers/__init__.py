@@ -1,0 +1,1 @@
+"""Folder-based scraper targets."""
