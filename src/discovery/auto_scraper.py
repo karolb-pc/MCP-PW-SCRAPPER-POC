@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-import importlib.util
-import inspect
+import json
 import shlex
+import time
+import csv
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from src.agents.credentials import Credentials, credentials_prompt_block, redact_values
 from src.agents.process_runner import run_logged_process
@@ -16,18 +19,17 @@ from src.agents.provider import (
     normalize_agent_provider,
 )
 from src.agents.terminal import emit_summary
-from src.utils import utc_timestamp_with_microseconds, write_json, write_text
+from src.browser import BrowserSessionProfile, session_prompt_block
+from src.utils import slugify, utc_timestamp_with_microseconds, write_json, write_text
 
 
 @dataclass(frozen=True)
 class DiscoveryResult:
     run_dir: Path
+    diagnostics_dir: Path
     output_path: Path
-    generated_extractor_path: Path
-    generated_transformer_path: Path
-    generated_loader_path: Path
-    raw_items_count: int
-    items_count: int
+    output_format: str
+    items_count: int | None
     agent_provider: str
 
 
@@ -38,199 +40,280 @@ class AutomatedScrapeDiscovery:
         user_prompt: str,
         output_path: Path,
         runs_dir: Path,
+        diagnostics_root_dir: Path,
+        output_format: str = "json",
         credentials: Credentials | None = None,
         agent_provider: str = "openai",
-        design_timeout: int = 900,
-        design_command: str | None = None,
+        scrape_timeout: int = 900,
+        scrape_command: str | None = None,
+        session_profile: BrowserSessionProfile | None = None,
     ):
         self.source_url = source_url
         self.user_prompt = user_prompt
         self.output_path = output_path
         self.runs_dir = runs_dir
+        self.diagnostics_root_dir = diagnostics_root_dir
+        self.output_format = output_format.strip() or "json"
         self.credentials = credentials
         self.agent_provider = normalize_agent_provider(agent_provider)
-        self.design_timeout = design_timeout
-        self.design_command = design_command
-        self.run_dir = runs_dir / utc_timestamp_with_microseconds()
-        self.generated_dir = self.run_dir / "generated"
+        self.scrape_timeout = scrape_timeout
+        self.scrape_command = scrape_command
+        self.session_profile = session_profile
+        self.timestamp = utc_timestamp_with_microseconds()
+        self.run_dir = runs_dir / self.timestamp
+        self.diagnostics_dir = diagnostics_root_dir / self._diagnostics_folder_name()
+        self._phase_timings: dict[str, float] = {}
+        self._agent_elapsed_seconds: float | None = None
 
     async def run(self) -> DiscoveryResult:
-        self._prepare_run_dir()
-        self._run_design_agent()
-        raw_items = await self._extract()
-        payload = self._transform(raw_items)
-        self._load(raw_items, payload)
-
-        result = DiscoveryResult(
-            run_dir=self.run_dir,
-            output_path=self.output_path,
-            generated_extractor_path=self.generated_dir / "extractor.py",
-            generated_transformer_path=self.generated_dir / "transformer.py",
-            generated_loader_path=self.generated_dir / "loader.py",
-            raw_items_count=len(raw_items),
-            items_count=len(payload.get("items", [])) if isinstance(payload.get("items"), list) else 0,
-            agent_provider=self.agent_provider,
-        )
-        emit_summary(
-            "discovery",
-            "Completed",
-            {
-                "provider": agent_display_name(self.agent_provider),
-                "raw_items": result.raw_items_count,
-                "items": result.items_count,
-                "output": str(result.output_path),
-                "run_dir": str(result.run_dir),
-            },
-        )
-        return result
+        total_started = time.perf_counter()
+        payload: Any = None
+        try:
+            self._time_phase("prepare", self._prepare_run_dir)
+            self._time_phase("agent_scrape", self._run_scrape_agent)
+            payload = self._time_phase("validate_output", self._read_and_validate_output)
+            status = self._payload_status(payload)
+            result = DiscoveryResult(
+                run_dir=self.run_dir,
+                diagnostics_dir=self.diagnostics_dir,
+                output_path=self.output_path,
+                output_format=self.output_format,
+                items_count=self._count_items(payload),
+                agent_provider=self.agent_provider,
+            )
+            self._write_analytics(
+                status=status,
+                total_seconds=time.perf_counter() - total_started,
+                payload=payload,
+            )
+            emit_summary(
+                "discovery",
+                status.capitalize(),
+                {
+                    "provider": agent_display_name(self.agent_provider),
+                    "items": result.items_count if result.items_count is not None else "unknown",
+                    "format": result.output_format,
+                    "output": str(result.output_path),
+                    "run_dir": str(result.run_dir),
+                    "diagnostics_dir": str(result.diagnostics_dir),
+                },
+            )
+            return result
+        except Exception as exc:
+            self._write_analytics(
+                status="failed",
+                total_seconds=time.perf_counter() - total_started,
+                payload=payload,
+                error=repr(exc),
+            )
+            raise
 
     def _prepare_run_dir(self) -> None:
-        self.generated_dir.mkdir(parents=True, exist_ok=True)
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
         write_text(self.run_dir / "user_prompt.md", self.user_prompt.strip() + "\n")
-        write_json(
-            self.run_dir / "request.json",
-            {
-                "source_url": self.source_url,
-                "agent_provider": self.agent_provider,
-                "use_credentials": self.credentials is not None,
-                "prompt_path": str(self.run_dir / "user_prompt.md"),
-                "generated_dir": str(self.generated_dir),
-                "output_path": str(self.output_path),
-            },
-        )
-        write_text(self.run_dir / "design_prompt.md", self._build_design_prompt(redacted=True))
+        write_text(self.diagnostics_dir / "user_prompt.md", self.user_prompt.strip() + "\n")
+        request = {
+            "mode": "direct_agent_discovery",
+            "timestamp": self.timestamp,
+            "source_url": self.source_url,
+            "output_format": self.output_format,
+            "agent_provider": self.agent_provider,
+            "use_credentials": self.credentials is not None,
+            "session_profile": self.session_profile.name if self.session_profile else None,
+            "session_profile_dir": str(self.session_profile.profile_dir) if self.session_profile else None,
+            "session_storage_state": str(self.session_profile.storage_state_path) if self.session_profile else None,
+            "session_user_data_dir": str(self.session_profile.user_data_dir) if self.session_profile else None,
+            "prompt_path": str(self.run_dir / "user_prompt.md"),
+            "output_path": str(self.output_path),
+            "run_dir": str(self.run_dir),
+            "diagnostics_dir": str(self.diagnostics_dir),
+        }
+        write_json(self.run_dir / "request.json", request)
+        write_json(self.diagnostics_dir / "request.json", request)
+        write_text(self.run_dir / "scrape_prompt.md", self._build_scrape_prompt(redacted=True))
+        write_text(self.diagnostics_dir / "scrape_prompt.md", self._build_scrape_prompt(redacted=True))
 
-    def _run_design_agent(self) -> None:
-        command = shlex.split(self.design_command) if self.design_command else build_agent_command(self.agent_provider)
-        log_path = self.run_dir / agent_log_name(self.agent_provider, "discovery_design")
+    def _run_scrape_agent(self) -> None:
+        command = shlex.split(self.scrape_command) if self.scrape_command else build_agent_command(self.agent_provider)
+        log_path = self.diagnostics_dir / agent_log_name(self.agent_provider, "direct_discovery")
         completed = run_logged_process(
             command=command,
-            input_text=self._build_design_prompt(redacted=False),
+            input_text=self._build_scrape_prompt(redacted=False),
             log_path=log_path,
-            timeout=self.design_timeout,
+            timeout=self.scrape_timeout,
             status_prefix=f"{self.agent_provider}_discovery",
-            task_title="Discovery scraper design agent",
+            task_title="Direct discovery scrape agent",
             task_details={
                 "provider": agent_display_name(self.agent_provider),
                 "source_url": self.source_url,
-                "generated_dir": str(self.generated_dir),
+                "output": str(self.output_path),
+                "format": self.output_format,
                 "credentials": "provided" if self.credentials else "not provided",
+                "session_profile": self.session_profile.name if self.session_profile else "not selected",
             },
             redact_values=redact_values(self.credentials),
             show_output_lines=True,
         )
         if completed.returncode != 0:
-            raise RuntimeError(
-                f"Discovery design agent failed with exit code {completed.returncode}. See {log_path}."
-            )
-        self._assert_generated_files()
+            raise RuntimeError(f"Direct discovery agent failed with exit code {completed.returncode}. See {log_path}.")
+        self._agent_elapsed_seconds = completed.elapsed_seconds
         write_text(
-            self.run_dir / "design_summary.md",
+            self.diagnostics_dir / "scrape_summary.md",
             "\n".join(
                 [
-                    "# Discovery Design Summary",
+                    "# Direct Discovery Summary",
                     "",
                     f"- Provider: {agent_display_name(self.agent_provider)}",
                     f"- Return code: {completed.returncode}",
                     f"- Elapsed: {completed.elapsed_seconds:.1f}s",
                     f"- Log: {log_path}",
-                    f"- Extractor: {self.generated_dir / 'extractor.py'}",
-                    f"- Transformer: {self.generated_dir / 'transformer.py'}",
-                    f"- Loader: {self.generated_dir / 'loader.py'}",
+                    f"- Output: {self.output_path}",
+                    f"- Format: {self.output_format}",
+                    f"- Diagnostics: {self.diagnostics_dir}",
                     "",
                 ]
             ),
         )
 
-    async def _extract(self) -> list[dict[str, Any]]:
-        module = self._load_module("discovery_generated_extractor", self.generated_dir / "extractor.py")
-        extractor_class = getattr(module, "DiscoveryExtractor", None)
-        if extractor_class is None:
-            raise RuntimeError(
-                "generated/extractor.py must define class DiscoveryExtractor(AbstractExtractor)."
-            )
-
-        extractor = extractor_class(
-            source_url=self.source_url,
-            credentials=self.credentials,
-            artifacts_dir=self.generated_dir,
-        )
-        result = extractor.extract()
-        if inspect.isawaitable(result):
-            result = await result
-        if not isinstance(result, list):
-            raise RuntimeError("generated extractor returned a non-list value.")
-        return result
-
-    def _transform(self, raw_items: list[dict[str, Any]]) -> dict[str, Any]:
-        module = self._load_module("discovery_generated_transformer", self.generated_dir / "transformer.py")
-        transformer_class = getattr(module, "DiscoveryTransformer", None)
-        if transformer_class is None:
-            raise RuntimeError(
-                "generated/transformer.py must define class DiscoveryTransformer(AbstractTransformer)."
-            )
-
-        transformer = transformer_class(
-            source_url=self.source_url,
-            user_prompt=self.user_prompt,
-            run_dir=self.run_dir,
-        )
-        payload = transformer.transform(raw_items=raw_items)
-        if not isinstance(payload, dict):
-            raise RuntimeError("generated transformer returned a non-dict value.")
-        if "items" not in payload or not isinstance(payload["items"], list):
-            raise RuntimeError("generated transformer payload must contain an items list.")
-        payload.setdefault("source_url", self.source_url)
-        payload.setdefault("user_prompt", self.user_prompt)
-        payload.setdefault("meta", {})
-        if isinstance(payload["meta"], dict):
-            payload["meta"].update(
-                {
-                    "mode": "llm_generated_discovery",
-                    "agent_provider": self.agent_provider,
-                    "artifacts_dir": str(self.run_dir),
-                    "extractor": str(self.generated_dir / "extractor.py"),
-                    "transformer": str(self.generated_dir / "transformer.py"),
-                }
-            )
-        return payload
-
-    def _load(self, raw_items: list[dict[str, Any]], payload: dict[str, Any]) -> None:
-        module = self._load_module("discovery_generated_loader", self.generated_dir / "loader.py")
-        loader_class = getattr(module, "DiscoveryLoader", None)
-        if loader_class is None:
-            raise RuntimeError("generated/loader.py must define class DiscoveryLoader(AbstractLoader).")
-
-        loader = loader_class(run_dir=self.run_dir, output_path=self.output_path)
-        result = loader.load(raw_items=raw_items, payload=payload)
-        if result is not None and not isinstance(result, (str, Path)):
-            raise RuntimeError("generated loader returned an unsupported value.")
-
-    def _assert_generated_files(self) -> None:
-        missing = [
-            path
-            for path in (
-                self.generated_dir / "extractor.py",
-                self.generated_dir / "transformer.py",
-                self.generated_dir / "loader.py",
-            )
-            if not path.exists()
-        ]
-        if missing:
-            joined = ", ".join(str(path) for path in missing)
-            raise RuntimeError(f"Discovery agent did not generate required file(s): {joined}.")
+    def _read_and_validate_output(self) -> Any:
+        if not self.output_path.exists():
+            raise RuntimeError(f"Discovery agent finished but output file does not exist: {self.output_path}")
+        content = self.output_path.read_text().strip()
+        if not content:
+            raise RuntimeError(f"Discovery output is empty: {self.output_path}")
+        if self.output_format.lower() == "json" or self.output_path.suffix.lower() == ".json":
+            try:
+                payload = json.loads(content)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"Discovery output is not valid JSON: {self.output_path}") from exc
+            write_json(self.run_dir / "output.json", payload)
+            write_json(self.diagnostics_dir / "output.json", payload)
+            return payload
+        output_name = f"output{self.output_path.suffix or '.txt'}"
+        write_text(self.run_dir / output_name, content + "\n")
+        write_text(self.diagnostics_dir / output_name, content + "\n")
+        if self.output_format.lower() == "csv" or self.output_path.suffix.lower() == ".csv":
+            return self._read_csv_payload(content)
+        return content
 
     @staticmethod
-    def _load_module(name: str, path: Path):
-        spec = importlib.util.spec_from_file_location(name, path)
-        if spec is None or spec.loader is None:
-            raise RuntimeError(f"Cannot load generated module: {path}")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
+    def _count_items(payload: Any) -> int | None:
+        if isinstance(payload, dict):
+            items = payload.get("items")
+            if isinstance(items, list):
+                return len(items)
+            return None
+        if isinstance(payload, list):
+            if all(isinstance(row, dict) for row in payload):
+                status_rows = [
+                    row
+                    for row in payload
+                    if isinstance(row.get("status"), str)
+                    and row.get("status", "").strip().lower() == "blocked"
+                ]
+                if status_rows and len(status_rows) == len(payload):
+                    return 0
+            return len(payload)
+        return None
 
-    def _build_design_prompt(self, redacted: bool) -> str:
-        return f"""You are implementing a one-off scraper for MCP-PW-SCRAPPER.
+    @staticmethod
+    def _read_csv_payload(content: str) -> list[dict[str, str]]:
+        reader = csv.DictReader(StringIO(content))
+        return [dict(row) for row in reader]
+
+    @staticmethod
+    def _payload_status(payload: Any) -> str:
+        if isinstance(payload, list) and all(isinstance(row, dict) for row in payload):
+            statuses = [
+                row.get("status", "").strip().lower()
+                for row in payload
+                if isinstance(row.get("status"), str) and row.get("status", "").strip()
+            ]
+            if statuses and all(status == "blocked" for status in statuses):
+                return "blocked"
+            if statuses and any(status == "blocked" for status in statuses):
+                return "partial"
+            return "ok"
+
+        if not isinstance(payload, dict):
+            return "ok"
+
+        candidates = [
+            payload.get("status"),
+            payload.get("meta", {}).get("status") if isinstance(payload.get("meta"), dict) else None,
+        ]
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip().lower()
+        return "ok"
+
+    def _diagnostics_folder_name(self) -> str:
+        prompt_slug = slugify(self.user_prompt, max_length=56, fallback="prompt")
+        host = urlparse(self.source_url).netloc or "source"
+        host = host.removeprefix("www.")
+        source_slug = slugify(host.split(".")[0], max_length=24, fallback="source")
+        return f"{self.timestamp}-{self.agent_provider}-{prompt_slug}-{source_slug}"
+
+    def _time_phase(self, name: str, action):
+        started = time.perf_counter()
+        try:
+            return action()
+        finally:
+            self._phase_timings[name] = time.perf_counter() - started
+
+    def _write_analytics(
+        self,
+        *,
+        status: str,
+        total_seconds: float,
+        payload: Any,
+        error: str | None = None,
+    ) -> None:
+        self.diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        timings = {
+            **self._phase_timings,
+            "total": total_seconds,
+        }
+        measured_phases = {key: value for key, value in self._phase_timings.items()}
+        longest_phase = max(measured_phases.items(), key=lambda item: item[1])[0] if measured_phases else None
+        analytics = {
+            "status": status,
+            "error": error,
+            "source_url": self.source_url,
+            "output_path": str(self.output_path),
+            "output_format": self.output_format,
+            "agent_provider": self.agent_provider,
+            "items_count": self._count_items(payload),
+            "run_dir": str(self.run_dir),
+            "diagnostics_dir": str(self.diagnostics_dir),
+            "timings_seconds": timings,
+            "longest_host_phase": longest_phase,
+            "agent_elapsed_seconds": self._agent_elapsed_seconds,
+        }
+        write_json(self.diagnostics_dir / "metrics.json", analytics)
+        write_text(
+            self.diagnostics_dir / "summary.md",
+            "\n".join(
+                [
+                    "# Scrape Diagnostics",
+                    "",
+                    f"- Status: {status}",
+                    f"- Source URL: {self.source_url}",
+                    f"- Output: {self.output_path}",
+                    f"- Items: {analytics['items_count'] if analytics['items_count'] is not None else 'unknown'}",
+                    f"- Total seconds: {total_seconds:.2f}",
+                    f"- Longest host phase: {longest_phase or 'unknown'}",
+                    f"- Agent process seconds: {self._agent_elapsed_seconds:.2f}" if self._agent_elapsed_seconds is not None else "- Agent process seconds: unknown",
+                    f"- Error: {error or 'none'}",
+                    "",
+                ]
+            ),
+        )
+
+    def _build_scrape_prompt(self, redacted: bool) -> str:
+        return f"""You are running a direct scraping task for MCP-PW-SCRAPPER.
 
 The user asked for this scrape goal:
 {self.user_prompt}
@@ -238,64 +321,57 @@ The user asked for this scrape goal:
 Source URL:
 {self.source_url}
 
-Generated-code directory:
-{self.generated_dir.resolve()}
+Output file:
+{self.output_path.resolve()}
 
-Required architecture:
-- Keep Extract / Transform / Load responsibilities separate.
-- You must create {self.generated_dir.resolve() / "extractor.py"}.
-- You must create {self.generated_dir.resolve() / "transformer.py"}.
-- You must create {self.generated_dir.resolve() / "loader.py"}.
-- Match the existing project architecture contracts under `src/contracts/`: generated extractor, transformer, and loader code must use classes, not loose top-level functions.
-- The host process owns orchestration and will run generated Extract, Transform, and Load in order.
+Output format:
+{self.output_format}
 
-Extractor contract:
-- In `extractor.py`, import `AbstractExtractor` from `src.contracts.extractor`.
-- Define `class DiscoveryExtractor(AbstractExtractor)`.
-- Constructor signature must be `def __init__(self, source_url: str, credentials: tuple[str, str] | None = None, artifacts_dir: Path | None = None)`.
-- Define `async def extract(self) -> list[dict[str, Any]]`.
-- Use Python Playwright inside `DiscoveryExtractor.extract`.
-- Open `self.source_url`, perform login only if `self.credentials` is provided and the page needs it, inspect the live DOM, and scrape records matching the user's goal.
-- Return raw records as dictionaries. Include raw text and useful raw fields; do not over-normalize in Extract.
-- Save optional debugging artifacts next to the generated files only if they help, for example `page.html` or `screenshot.png`.
+Run artifacts directory:
+{self.run_dir.resolve()}
 
-Transformer contract:
-- In `transformer.py`, import `AbstractTransformer` from `src.contracts.transformer`.
-- Define `class DiscoveryTransformer(AbstractTransformer)`.
-- Constructor signature must be `def __init__(self, source_url: str, user_prompt: str, run_dir: Path)`.
-- Define `def transform(self, raw_items: list[dict[str, Any]]) -> dict[str, Any]`.
-- Convert raw records into a stable JSON payload using the shared Extract / Transform / Load style.
-- The payload must contain `items: list[dict]`.
-- Include `source_url`, `user_prompt`, and a `meta` dict when useful.
-- Normalize obvious numbers such as prices into numeric fields while keeping original text fields.
-- Prefer small helper methods on the transformer class for parsing and normalization, for example `parse_price`, `normalize_text`, or `absolute_url`.
+Diagnostics directory:
+{self.diagnostics_dir.resolve()}
 
-Load contract:
-- In `loader.py`, import `AbstractLoader` from `src.contracts.loader`.
-- Define `class DiscoveryLoader(AbstractLoader)`.
-- Constructor signature must be `def __init__(self, run_dir: Path, output_path: Path)`.
-- Define `def load(self, raw_items: list[dict[str, Any]], payload: dict[str, Any]) -> Path`.
-- For this POC, the loader should write JSON files only:
-  - `self.run_dir / "raw_items.json"`
-  - `self.run_dir / "output.json"`
-  - `self.output_path`
-- Use `src.utils.write_json` or standard `json.dumps(..., ensure_ascii=False, indent=2)`.
-- Return `self.output_path`.
+Core workflow:
+- Use Playwright MCP/browser MCP to inspect and interact with the live page.
+- Scrape the requested data directly during this agent run.
+- Do not create scraper source code, generated extractor code, transformer code, loader code, or reusable scraping scripts.
+- Do not modify repository source files.
+- Save the final scraped result to the exact output file above.
+- Save optional supporting artifacts only under the diagnostics directory, for example page notes, screenshots, or raw notes.
+
+JSON output rules:
+- When the requested output format is JSON, write a JSON object.
+- Prefer this shape unless the user explicitly requested a different schema:
+  {{
+    "source_url": "...",
+    "user_prompt": "...",
+    "items": [
+      {{ "...": "..." }}
+    ],
+    "meta": {{
+      "mode": "direct_agent_discovery"
+    }}
+  }}
+- Include stable field names based on the user's request.
+- Keep useful original text fields, and normalize obvious numbers/dates/URLs when it is safe.
 
 Browser/tooling guidance:
-- You must use Playwright MCP/browser MCP to inspect and understand the live page before generating code.
-- If Playwright MCP is not available in your agent environment, stop and report that browser MCP is required for discovery.
+- If Playwright MCP is not available in your agent environment, stop and report that browser MCP is required for direct discovery.
 - You are running unattended from the host process; do not ask the user to approve MCP/tool calls.
-- The generated extractor may use Python Playwright at runtime after MCP-based analysis is complete.
-- The generated code must be self-contained and runnable by the host process.
+- Prefer low-noise browser operations: navigate once, use snapshots/DOM inspection/evaluate for extraction, and avoid opening product pages unless the user prompt explicitly requires product-detail data.
+- Do not browse freely, compare unrelated pages, add items to cart, sign in, change account settings, or perform actions unrelated to collecting the requested fields.
+- Close the browser/page when the scrape is complete if the MCP tool exposes a close action.
+- If a CAPTCHA or anti-bot challenge appears, do not bypass it. Save any useful diagnostics under the diagnostics directory and report the blocker in the output.
 
 Credential instructions:
 {credentials_prompt_block(self.credentials, redacted=redacted)}
 
+Session instructions:
+{session_prompt_block(self.session_profile)}
+
 Constraints:
-- Only write files under {self.generated_dir.resolve()}.
-- Do not modify existing scraper targets outside this discovery run.
-- Avoid broad abstractions. This is generated per-source code and can be replaced by later runs.
 - Do not print credentials or persist credential values.
-- Finish only after all three required files exist: `extractor.py`, `transformer.py`, and `loader.py`.
+- Finish only after the output file exists and contains the requested data or a clear structured blocker report.
 """

@@ -1,1 +1,0 @@
-"""Shared scraper architecture contracts."""

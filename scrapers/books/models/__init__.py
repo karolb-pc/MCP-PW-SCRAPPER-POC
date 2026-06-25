@@ -1,1 +1,0 @@
-"""Books models package."""

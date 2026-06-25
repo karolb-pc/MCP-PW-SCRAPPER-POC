@@ -1,1 +1,0 @@
-"""Books extractor package."""

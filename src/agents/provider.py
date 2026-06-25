@@ -8,6 +8,7 @@ SUPPORTED_AGENT_PROVIDERS = ("openai", "claude")
 DEFAULT_AGENT_PROVIDER = "openai"
 OPENAI_UNATTENDED_FLAGS = ("--dangerously-bypass-approvals-and-sandbox",)
 CLAUDE_UNATTENDED_FLAGS = ("--dangerously-skip-permissions",)
+CLAUDE_STREAMING_FLAGS = ("--output-format", "stream-json", "--verbose")
 
 
 def normalize_agent_provider(provider: str | None) -> str:
@@ -70,9 +71,21 @@ def build_agent_command(provider: str) -> list[str]:
                 "Install Claude Code CLI, set CLAUDE_CLI_PATH, select --openai, or pass a custom command."
             )
 
+        mcp_config_path = Path.cwd() / "config" / "claude.mcp.json"
+        if not mcp_config_path.exists():
+            raise RuntimeError(
+                "Claude agent requested, but config/claude.mcp.json was not found. "
+                "Run the command from the project root or restore the project Claude MCP config."
+            )
+
         return [
             claude_path,
             "-p",
+            *CLAUDE_STREAMING_FLAGS,
+            "--mcp-config",
+            str(mcp_config_path),
+            "--strict-mcp-config",
+            "--no-chrome",
             *CLAUDE_UNATTENDED_FLAGS,
         ]
 

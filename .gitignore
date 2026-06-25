@@ -4,11 +4,9 @@ __pycache__/
 .ruff_cache/
 *.pyc
 .env
-output/
-data/
-diagnostics/
-notifications/
-instrukcje/
+/output/
+/data/
+/diagnostics/
+/sessions/*
+!sessions/README.md
 .playwright-mcp/
-scrapers/discovery/*
-!scrapers/discovery/.gitkeep

@@ -1,244 +1,234 @@
 # MCP-PW-SCRAPPER
 
-`MCP-PW-SCRAPPER` is a POC for folder-based scrapers that can be run, audited, extended, broken for repair tests, and self-repaired by an LLM agent.
+`poc-simplest` is a direct-discovery POC: provide a URL, a prompt, and an output format, and an LLM agent uses Playwright MCP/browser MCP to scrape the page immediately.
 
-The important rule is simple:
-
-```bash
-uv run python main.py <command> --path <scraper-folder-or-discovery-run>
-```
-
-There is no privileged scraper in `main.py`. The old Books scraper now lives under `scrapers/books/` like any other scraper target.
+There is no generated scraper code in this flow. The agent must not create extractor, transformer, loader, or reusable scraper scripts. It inspects the live page, performs the requested browser actions, and writes the final data file.
 
 ## Quick Start
+
+Discovery commands below default to `--openai`. Use `--claude` in the same position when you want to run the same scrape through Claude.
 
 ```bash
 uv sync
 uv run playwright install chromium
-uv run python main.py run --path scrapers/books --quiet --browser playwright
-uv run python main.py validate scrapers/books/output/books.json
+uv run python main.py discover --openai \
+  --url "https://books.toscrape.com/" \
+  --prompt "Scrape the first page of books with title, price, availability, rating, and absolute URL." \
+  --output output/books.json \
+  --diagnostics-dir diagnostics \
+  --output-format json
 ```
 
-Expected output:
+## How To Run Scenarios
 
-- `scrapers/books/output/books.json`
-- `scrapers/books/data/successful/latest.json`
-- a timestamped export under `scrapers/books/data/successful/`
-
-## Command-First CLI
-
-Use the scraper path first:
+Install dependencies once:
 
 ```bash
-uv run python main.py run --path scrapers/books --quiet --browser playwright
-uv run python main.py audit --path scrapers/books --openai --fix
-uv run python main.py repair --path scrapers/books --openai --browser playwright
-uv run python main.py semi-discover --path scrapers/books --openai --prompt "Add stock status."
-uv run python main.py break --path scrapers/books --openai
+uv sync
+uv run playwright install chromium
 ```
 
-The same pattern works for generated discovery runs:
+Run the default Codex/OpenAI path:
 
 ```bash
-uv run python main.py run --path scrapers/discovery/<timestamp>
-uv run python main.py audit --path scrapers/discovery/<timestamp> --fix --openai
-uv run python main.py repair --path scrapers/discovery/<timestamp> --openai
-uv run python main.py semi-discover --path scrapers/discovery/<timestamp> --openai --prompt "Add rating."
-uv run python main.py break --path scrapers/discovery/<timestamp> --openai
+uv run python main.py discover --openai \
+  --url "https://www.amazon.com/s?k=macbook" \
+  --prompt-file instructions/amazon/amazon-com-search-macbooks.md \
+  --output output/amazon-com-macbooks.json \
+  --diagnostics-dir diagnostics
 ```
 
+Run the same scenario through Claude:
 
+```bash
+uv run python main.py discover --claude \
+  --url "https://www.amazon.com/s?k=macbook" \
+  --prompt-file instructions/amazon/amazon-com-search-macbooks.md \
+  --output output/amazon-com-macbooks-claude.json \
+  --diagnostics-dir diagnostics
+```
 
-## Scraper Folder Contract
+More ready-to-run scenarios are in `DISCOVERY_TEST_SCENARIOS.md` and `instructions/amazon/README.md`.
 
-Every non-discovery scraper folder must contain `scraper_target.json`.
+The same command can be run through the direct root options:
 
-Example:
+```bash
+uv run python main.py \
+  --url "https://books.toscrape.com/" \
+  --prompt "Scrape book titles and prices from the first page." \
+  --output output/books.json \
+  --diagnostics-dir diagnostics
+```
+
+## Output
+
+For JSON output, the agent is instructed to write a JSON object like:
 
 ```json
 {
-  "name": "books",
-  "kind": "folder_etl",
-  "source_url": "https://books.toscrape.com/",
-  "files": [
-    "main.py",
-    "etl.py",
-    "extractor/books.py",
-    "transformer/books.py",
-    "validator/books.py",
-    "models/book.py",
-    "settings.py"
-  ],
-  "allowed_paths": [
-    "etl.py",
-    "extractor/books.py",
-    "transformer/books.py",
-    "validator/books.py",
-    "models/book.py",
-    "settings.py"
-  ],
-  "run_command": [
-    "uv",
-    "run",
-    "python",
-    "-m",
-    "scrapers.books.main",
-    "run",
-    "--quiet",
-    "--browser",
-    "playwright"
-  ],
-  "verification_command": [
-    "uv",
-    "run",
-    "python",
-    "-m",
-    "scrapers.books.main",
-    "run",
-    "--quiet",
-    "--browser",
-    "playwright"
-  ],
-  "output_path": "output/books.json"
+  "source_url": "https://example.com",
+  "user_prompt": "Scrape ...",
+  "items": [],
+  "meta": {
+    "mode": "direct_agent_discovery"
+  }
 }
 ```
 
-The host uses this manifest to infer:
-
-- source URL
-- files to inspect
-- files the LLM may patch
-- run command
-- verification command
-- output path
-
-## Discovery
-
-Full discovery starts from a URL and a user prompt:
+Validate JSON outputs with:
 
 ```bash
-uv run python main.py discover \
-  --url https://books.toscrape.com/ \
-  --openai \
-  --prompt "Scrape book title, price, category and URL, but keep the first scraper intentionally small." \
-  --output output/discovery-books.json
+uv run python main.py validate output/books.json
 ```
 
-Discovery creates:
+## Run Artifacts And Diagnostics
+
+Each discovery run creates an artifact folder under:
 
 ```text
-scrapers/discovery/<timestamp>/
-  request.json
-  user_prompt.md
-  design_prompt.md
-  design_summary.md
-  generated/extractor.py
-  generated/transformer.py
-  generated/loader.py
-  raw_items.json
-  output.json
+output/discovery-runs/<timestamp>/
 ```
 
-`scrapers/discovery/*` is ignored by git, except `scrapers/discovery/.gitkeep`.
-The folder exists in the repo, but generated discovery scrapers do not get committed by accident.
+Typical files:
 
-Generated discovery scrapers use the same command-first CLI:
+```text
+request.json
+user_prompt.md
+scrape_prompt.md
+openai_direct_discovery.log
+scrape_summary.md
+output.json
+```
+
+Each scrape also creates a diagnostics folder under:
+
+```text
+diagnostics/<timestamp>-<provider>-<prompt-slug>-<source-slug>/
+```
+
+Typical diagnostics files:
+
+```text
+request.json
+user_prompt.md
+scrape_prompt.md
+openai_direct_discovery.log
+scrape_summary.md
+metrics.json
+summary.md
+output.json
+```
+
+`metrics.json` is host-generated and includes total time, prepare time, whole agent process time, output validation time, longest host phase, and item count. It does not split agent-internal scraping from processing.
+
+The run folder and diagnostics folder are not scraper projects.
+
+## Sessions
+
+Browser session profiles remain available for authenticated or stateful pages:
 
 ```bash
-uv run python main.py run --path scrapers/discovery/<timestamp>
-uv run python main.py audit --path scrapers/discovery/<timestamp> --fix --openai
-uv run python main.py repair --path scrapers/discovery/<timestamp> --openai
-uv run python main.py semi-discover --path scrapers/discovery/<timestamp> --openai --prompt "Add availability."
+uv run python main.py discover --openai \
+  --url "https://example.com/account/orders" \
+  --prompt "Scrape the visible order list." \
+  --session-profile example-private \
+  --output output/orders.json \
+  --diagnostics-dir diagnostics
 ```
+
+Session profiles live under `sessions/<profile>/` and record usage in `usage.jsonl`. Configure Playwright MCP/browser MCP with the paths shown in `sessions/<profile>/session.md` when the MCP server itself needs to reuse cookies or local storage.
 
 ## Credentials
 
-Never pass login/password directly in CLI args. Use `.env`:
-
-```env
-LOGIN=user@example.com
-PASSWORD=secret
-```
-
-Then pass:
+For login-required flows, copy `.env.example` to `.env` and set:
 
 ```bash
-uv run python main.py audit --path scrapers/books --use-credentials --openai --fix
+LOGIN=
+PASSWORD=
 ```
 
-The agent prompt receives credentials only through the controlled credentials block, and logs/prompts written to diagnostics are redacted.
+Then run with `--use-credentials`. Credentials are passed to the agent prompt through a redacted logging path and must not be written to outputs.
 
-## Local Environment Overrides
+## Diagnostics
 
-Use `.env.example` as the template for local configuration:
+Use `diagnose` for a plain Playwright/Camoufox page snapshot:
 
 ```bash
-cp .env.example .env
+uv run python main.py diagnose \
+  --url "https://books.toscrape.com/" \
+  --diagnostics-dir diagnostics/books
 ```
 
-Useful local overrides:
+Amazon prompt variants live under `instructions/amazon/`, for example:
 
-```env
-CODEX_CLI_PATH=<absolute-path-to-codex>
-CLAUDE_CLI_PATH=<absolute-path-to-claude>
-SCRAPER_DISCOVERY_RUNS_DIR=scrapers/discovery
+```bash
+uv run python main.py discover --openai \
+  --url "https://www.amazon.com/s?k=macbook" \
+  --prompt-file instructions/amazon/amazon-com-search-macbooks.md \
+  --output output/amazon-com-macbooks.json \
+  --diagnostics-dir diagnostics
+```
+
+To compare a deep link with agent-driven navigation from the Amazon.com homepage:
+
+```bash
+uv run python main.py discover --openai \
+  --url "https://www.amazon.com/" \
+  --prompt-file instructions/amazon/amazon-com-home-to-macbooks.md \
+  --output output/amazon-com-macbooks-home-navigation.json \
+  --diagnostics-dir diagnostics
+```
+
+Compare its `metrics.json` with the deep-link run. The homepage variant should usually have a longer `agent_elapsed_seconds` / `timings_seconds.agent_scrape` because the agent must open Amazon, handle consent if needed, use search, and wait for results.
+
+## Configuration
+
+Useful environment variables:
+
+```bash
+CODEX_CLI_PATH=
+CLAUDE_CLI_PATH=
+SCRAPER_AGENT_PROVIDER=openai
 SCRAPER_DISCOVERY_OUTPUT=output/discovery.json
-SCRAPER_DIAGNOSTICS_DIR=diagnostics/latest
-SCRAPER_AUDIT_DIAGNOSTICS_DIR=diagnostics/source-audit
-SCRAPER_BREAK_DIAGNOSTICS_DIR=diagnostics/llm-break-demo
-SCRAPER_SEMI_DISCOVERY_DIAGNOSTICS_DIR=diagnostics/semi-discovery
+SCRAPER_DISCOVERY_RUNS_DIR=output/discovery-runs
+SCRAPER_DISCOVERY_DIAGNOSTICS_DIR=diagnostics
+SCRAPER_SESSIONS_DIR=sessions
 ```
 
-Leave these unset when the defaults work. Real `.env` files are local-only and ignored by git.
+## Claude MCP setup
 
-## LLM Providers
-
-Use one provider flag:
+Claude Code uses its own MCP configuration. This project includes `config/claude.mcp.json` with the Playwright MCP server:
 
 ```bash
-uv run python main.py audit --path scrapers/books --openai --fix
-uv run python main.py audit --path scrapers/books --claude --fix
+claude mcp list
 ```
 
-OpenAI/Codex and Claude commands are built centrally in `src/agents/provider.py`. Shared credentials, process execution, terminal events, and provider wrappers live under `src/agents/` because discovery, semi-discovery, audit, break, and repair all use the same agent runtime. `src/repair/` only owns the self-repair orchestration loop.
-
-## Playwright MCP
-
-LLM-driven discovery, audit, semi-discovery, break, and repair prompts require Playwright MCP/browser MCP. The agent is instructed to inspect the live source with browser MCP before changing scraper code.
-
-Local scraper execution itself can use normal Playwright Python:
+If the `playwright` server is shown as pending, run Claude once in this project and approve the project MCP server:
 
 ```bash
-uv run python main.py run --path scrapers/books --quiet --browser playwright
+claude
 ```
 
-## Project Layout
-
-```text
-main.py
-  command-first host CLI and orchestration
-
-src/
-  shared host infrastructure:
-  discovery, repair, diagnostics, notification, target resolution,
-  ETL base classes and shared loader abstractions
-
-scrapers/books/
-  example folder-based scraper target:
-  scraper_target.json, local main.py, ETL, extractor, transformer,
-  validator, model, settings, output and exports
-
-scrapers/discovery/
-  generated scraper runs created by full discovery
-```
-
-## Useful Commands
+Then verify:
 
 ```bash
-uv run python -m compileall main.py scraper.py src scrapers
-uv run python main.py run --path scrapers/books --quiet --browser playwright
-uv run python main.py validate scrapers/books/output/books.json
-uv run python main.py audit --path scrapers/books --openai --fix
-uv run python main.py break --path scrapers/books --openai
-uv run python main.py repair --path scrapers/books --openai --browser playwright
+claude mcp get playwright
+```
+
+After that, Claude-backed discovery can use browser tools:
+
+```bash
+uv run python main.py discover --claude \
+  --url "https://www.amazon.com/gp/bestsellers/" \
+  --prompt-file instructions/amazon/amazon-com-bestsellers.md \
+  --output output/amazon-com-bestsellers.json
+```
+
+The project runner starts Claude in print/streaming mode with `config/claude.mcp.json`, strict MCP config, no Chrome integration, and headless Playwright MCP. You should see progress in the terminal only, not a visible browser window.
+
+## Verification
+
+```bash
+uv run python -m compileall main.py src
+uv run python main.py --help
 ```

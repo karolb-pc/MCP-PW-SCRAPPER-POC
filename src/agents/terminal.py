@@ -29,6 +29,10 @@ def normalize_agent_line(line: str, max_chars: int = 500) -> str | None:
     if not stripped:
         return None
 
+    json_line = _normalize_json_agent_line(stripped)
+    if json_line:
+        stripped = json_line
+
     noisy_prefixes = (
         "DEBUG:",
         "INFO:",
@@ -41,6 +45,85 @@ def normalize_agent_line(line: str, max_chars: int = 500) -> str | None:
     if len(stripped) > max_chars:
         stripped = stripped[: max_chars - 3] + "..."
     return stripped
+
+
+def _normalize_json_agent_line(line: str) -> str | None:
+    if not line.startswith("{"):
+        return None
+
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    event_type = payload.get("type")
+    if event_type == "assistant":
+        text = _extract_content_text(payload.get("message"))
+        if text:
+            return text
+        tool_names = _extract_tool_names(payload.get("message"))
+        if tool_names:
+            return "tools: " + ", ".join(tool_names)
+    if event_type == "result":
+        parts = ["result"]
+        subtype = payload.get("subtype")
+        if subtype:
+            parts.append(str(subtype))
+        if payload.get("num_turns") is not None:
+            parts.append(f"turns={payload['num_turns']}")
+        if payload.get("duration_ms") is not None:
+            parts.append(f"duration={payload['duration_ms']}ms")
+        if payload.get("total_cost_usd") is not None:
+            parts.append(f"cost=${payload['total_cost_usd']}")
+        result_text = payload.get("result")
+        if isinstance(result_text, str) and result_text.strip():
+            parts.append(result_text.strip())
+        return " | ".join(parts)
+    if event_type == "system":
+        subtype = payload.get("subtype")
+        return f"system: {subtype}" if subtype else "system"
+
+    if isinstance(event_type, str) and event_type:
+        text = _extract_content_text(payload)
+        return f"{event_type}: {text}" if text else event_type
+    return None
+
+
+def _extract_content_text(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, dict):
+        content = value.get("content")
+        if isinstance(content, list):
+            texts: list[str] = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    text = item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        texts.append(text.strip())
+            return " ".join(texts) or None
+        text = value.get("text")
+        if isinstance(text, str):
+            return text.strip() or None
+    return None
+
+
+def _extract_tool_names(value: Any) -> list[str]:
+    if not isinstance(value, dict):
+        return []
+    content = value.get("content")
+    if not isinstance(content, list):
+        return []
+    names: list[str] = []
+    for item in content:
+        if isinstance(item, dict) and item.get("type") == "tool_use":
+            name = item.get("name")
+            if isinstance(name, str) and name:
+                names.append(name)
+    return names
 
 
 def emit_task_start(

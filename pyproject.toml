@@ -1,7 +1,7 @@
 [project]
 name = "mcp-pw-scrapper"
 version = "0.1.0"
-description = "Tiny Python + Playwright/Camoufox scraping POC that returns transformed JSON."
+description = "Direct LLM + Playwright MCP discovery scraping POC."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

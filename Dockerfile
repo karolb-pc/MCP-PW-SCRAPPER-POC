@@ -13,4 +13,4 @@ RUN uv run playwright install --with-deps chromium
 
 COPY . .
 
-CMD ["uv", "run", "python", "main.py", "run", "--quiet"]
+CMD ["uv", "run", "python", "main.py", "--help"]
