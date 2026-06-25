@@ -339,7 +339,9 @@ Core workflow:
 - Do not create scraper source code, generated extractor code, transformer code, loader code, or reusable scraping scripts.
 - Do not modify repository source files.
 - Save the final scraped result to the exact output file above.
-- Save optional supporting artifacts only under the diagnostics directory, for example page notes, screenshots, or raw notes.
+- Save supporting artifacts only under the diagnostics directory, for example page notes, screenshots, or raw notes.
+- If the run is blocked, partial because of an error/limitation, hits login/OTP/CAPTCHA/anti-bot, or sees repeated navigation/pagination failure, capture a screenshot if the browser MCP exposes screenshot support and save it under the diagnostics directory with a descriptive filename.
+- When a page action triggers lazy loading, pagination, or an infinite-scroll spinner, wait for the loading indicator to disappear, the target data count to change, or a clearly stated timeout before deciding that no new data appeared. Do not mark repeated data or capture the final failure screenshot while a loading spinner is still active unless the failure is specifically a loading timeout.
 
 JSON output rules:
 - When the requested output format is JSON, write a JSON object.
@@ -363,7 +365,7 @@ Browser/tooling guidance:
 - Prefer low-noise browser operations: navigate once, use snapshots/DOM inspection/evaluate for extraction, and avoid opening product pages unless the user prompt explicitly requires product-detail data.
 - Do not browse freely, compare unrelated pages, add items to cart, sign in, change account settings, or perform actions unrelated to collecting the requested fields.
 - Close the browser/page when the scrape is complete if the MCP tool exposes a close action.
-- If a CAPTCHA or anti-bot challenge appears, do not bypass it. Save any useful diagnostics under the diagnostics directory and report the blocker in the output.
+- If a CAPTCHA, OTP, anti-bot challenge, login failure, repeated pagination failure, or unavailable page appears, do not bypass it. Save any useful diagnostics under the diagnostics directory, including a screenshot when possible, and report the blocker or limitation in the output.
 
 Credential instructions:
 {credentials_prompt_block(self.credentials, redacted=redacted)}
