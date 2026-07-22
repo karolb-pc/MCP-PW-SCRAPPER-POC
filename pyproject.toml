@@ -7,8 +7,11 @@ requires-python = ">=3.11"
 dependencies = [
     "camoufox>=0.4.11",
     "click>=8.1.7",
+    "fastapi>=0.115.0",
     "loguru>=0.7.2",
     "playwright>=1.49.0",
+    "pydantic>=2.0.0",
+    "uvicorn>=0.30.0",
 ]
 
 [tool.uv]

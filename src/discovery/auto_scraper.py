@@ -4,6 +4,7 @@ import json
 import shlex
 import time
 import csv
+import shutil
 from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
@@ -16,6 +17,7 @@ from src.agents.provider import (
     agent_display_name,
     agent_log_name,
     build_agent_command,
+    build_playwright_mcp_args,
     normalize_agent_provider,
 )
 from src.agents.terminal import emit_summary
@@ -34,6 +36,13 @@ class DiscoveryResult:
 
 
 class AutomatedScrapeDiscovery:
+    run_mode = "direct_agent_discovery"
+    log_suffix = "direct_discovery"
+    status_prefix_suffix = "discovery"
+    task_title = "Direct discovery scrape agent"
+    summary_title = "# Direct Discovery Summary"
+    summary_channel = "discovery"
+
     def __init__(
         self,
         source_url: str,
@@ -43,7 +52,7 @@ class AutomatedScrapeDiscovery:
         diagnostics_root_dir: Path,
         output_format: str = "json",
         credentials: Credentials | None = None,
-        agent_provider: str = "openai",
+        agent_provider: str = "claude",
         scrape_timeout: int = 900,
         scrape_command: str | None = None,
         session_profile: BrowserSessionProfile | None = None,
@@ -68,9 +77,14 @@ class AutomatedScrapeDiscovery:
     async def run(self) -> DiscoveryResult:
         total_started = time.perf_counter()
         payload: Any = None
+        cleanup_completed = False
         try:
             self._time_phase("prepare", self._prepare_run_dir)
             self._time_phase("agent_scrape", self._run_scrape_agent)
+            cleanup_action = self._post_agent_cleanup_action()
+            if cleanup_action is not None:
+                self._time_phase("generated_code_cleanup", cleanup_action)
+                cleanup_completed = True
             payload = self._time_phase("validate_output", self._read_and_validate_output)
             status = self._payload_status(payload)
             result = DiscoveryResult(
@@ -87,9 +101,10 @@ class AutomatedScrapeDiscovery:
                 payload=payload,
             )
             emit_summary(
-                "discovery",
+                self.summary_channel,
                 status.capitalize(),
                 {
+                    "mode": self.run_mode,
                     "provider": agent_display_name(self.agent_provider),
                     "items": result.items_count if result.items_count is not None else "unknown",
                     "format": result.output_format,
@@ -100,11 +115,18 @@ class AutomatedScrapeDiscovery:
             )
             return result
         except Exception as exc:
+            cleanup_error = None
+            cleanup_action = self._post_agent_cleanup_action()
+            if cleanup_action is not None and not cleanup_completed:
+                try:
+                    self._time_phase("generated_code_cleanup", cleanup_action)
+                except Exception as cleanup_exc:
+                    cleanup_error = repr(cleanup_exc)
             self._write_analytics(
                 status="failed",
                 total_seconds=time.perf_counter() - total_started,
                 payload=payload,
-                error=repr(exc),
+                error=f"{repr(exc)}; cleanup_error={cleanup_error}" if cleanup_error else repr(exc),
             )
             raise
 
@@ -115,7 +137,7 @@ class AutomatedScrapeDiscovery:
         write_text(self.run_dir / "user_prompt.md", self.user_prompt.strip() + "\n")
         write_text(self.diagnostics_dir / "user_prompt.md", self.user_prompt.strip() + "\n")
         request = {
-            "mode": "direct_agent_discovery",
+            "mode": self.run_mode,
             "timestamp": self.timestamp,
             "source_url": self.source_url,
             "output_format": self.output_format,
@@ -129,22 +151,54 @@ class AutomatedScrapeDiscovery:
             "output_path": str(self.output_path),
             "run_dir": str(self.run_dir),
             "diagnostics_dir": str(self.diagnostics_dir),
+            **self._request_metadata_extras(),
         }
         write_json(self.run_dir / "request.json", request)
         write_json(self.diagnostics_dir / "request.json", request)
         write_text(self.run_dir / "scrape_prompt.md", self._build_scrape_prompt(redacted=True))
         write_text(self.diagnostics_dir / "scrape_prompt.md", self._build_scrape_prompt(redacted=True))
 
+    def _resolve_agent_command(self) -> list[str]:
+        if self.scrape_command:
+            return shlex.split(self.scrape_command)
+
+        # Give every run an isolated, in-memory browser profile and a unique MCP
+        # output dir so concurrent runs do not fight over the shared on-disk
+        # profile ("Browser is already in use ... use --isolated").
+        playwright_output_dir = self.run_dir / ".playwright-mcp"
+        playwright_output_dir.mkdir(parents=True, exist_ok=True)
+
+        mcp_config_path: Path | None = None
+        if self.agent_provider == "claude":
+            mcp_config_path = self.run_dir / "claude.mcp.json"
+            write_json(
+                mcp_config_path,
+                {
+                    "mcpServers": {
+                        "playwright": {
+                            "command": "npx",
+                            "args": build_playwright_mcp_args(output_dir=playwright_output_dir),
+                        }
+                    }
+                },
+            )
+
+        return build_agent_command(
+            self.agent_provider,
+            mcp_config_path=mcp_config_path,
+            playwright_output_dir=playwright_output_dir,
+        )
+
     def _run_scrape_agent(self) -> None:
-        command = shlex.split(self.scrape_command) if self.scrape_command else build_agent_command(self.agent_provider)
-        log_path = self.diagnostics_dir / agent_log_name(self.agent_provider, "direct_discovery")
+        command = self._resolve_agent_command()
+        log_path = self.diagnostics_dir / agent_log_name(self.agent_provider, self.log_suffix)
         completed = run_logged_process(
             command=command,
             input_text=self._build_scrape_prompt(redacted=False),
             log_path=log_path,
             timeout=self.scrape_timeout,
-            status_prefix=f"{self.agent_provider}_discovery",
-            task_title="Direct discovery scrape agent",
+            status_prefix=f"{self.agent_provider}_{self.status_prefix_suffix}",
+            task_title=self.task_title,
             task_details={
                 "provider": agent_display_name(self.agent_provider),
                 "source_url": self.source_url,
@@ -157,14 +211,15 @@ class AutomatedScrapeDiscovery:
             show_output_lines=True,
         )
         if completed.returncode != 0:
-            raise RuntimeError(f"Direct discovery agent failed with exit code {completed.returncode}. See {log_path}.")
+            raise RuntimeError(f"{self.task_title} failed with exit code {completed.returncode}. See {log_path}.")
         self._agent_elapsed_seconds = completed.elapsed_seconds
         write_text(
             self.diagnostics_dir / "scrape_summary.md",
             "\n".join(
                 [
-                    "# Direct Discovery Summary",
+                    self.summary_title,
                     "",
+                    f"- Mode: {self.run_mode}",
                     f"- Provider: {agent_display_name(self.agent_provider)}",
                     f"- Return code: {completed.returncode}",
                     f"- Elapsed: {completed.elapsed_seconds:.1f}s",
@@ -281,6 +336,7 @@ class AutomatedScrapeDiscovery:
         analytics = {
             "status": status,
             "error": error,
+            "mode": self.run_mode,
             "source_url": self.source_url,
             "output_path": str(self.output_path),
             "output_format": self.output_format,
@@ -291,6 +347,7 @@ class AutomatedScrapeDiscovery:
             "timings_seconds": timings,
             "longest_host_phase": longest_phase,
             "agent_elapsed_seconds": self._agent_elapsed_seconds,
+            **self._analytics_extras(),
         }
         write_json(self.diagnostics_dir / "metrics.json", analytics)
         write_text(
@@ -300,6 +357,7 @@ class AutomatedScrapeDiscovery:
                     "# Scrape Diagnostics",
                     "",
                     f"- Status: {status}",
+                    f"- Mode: {self.run_mode}",
                     f"- Source URL: {self.source_url}",
                     f"- Output: {self.output_path}",
                     f"- Items: {analytics['items_count'] if analytics['items_count'] is not None else 'unknown'}",
@@ -311,6 +369,15 @@ class AutomatedScrapeDiscovery:
                 ]
             ),
         )
+
+    def _request_metadata_extras(self) -> dict[str, Any]:
+        return {}
+
+    def _analytics_extras(self) -> dict[str, Any]:
+        return {}
+
+    def _post_agent_cleanup_action(self):
+        return None
 
     def _build_scrape_prompt(self, redacted: bool) -> str:
         return f"""You are running a direct scraping task for MCP-PW-SCRAPPER.
@@ -366,6 +433,121 @@ Browser/tooling guidance:
 - Do not browse freely, compare unrelated pages, add items to cart, sign in, change account settings, or perform actions unrelated to collecting the requested fields.
 - Close the browser/page when the scrape is complete if the MCP tool exposes a close action.
 - If a CAPTCHA, OTP, anti-bot challenge, login failure, repeated pagination failure, or unavailable page appears, do not bypass it. Save any useful diagnostics under the diagnostics directory, including a screenshot when possible, and report the blocker or limitation in the output.
+
+Credential instructions:
+{credentials_prompt_block(self.credentials, redacted=redacted)}
+
+Session instructions:
+{session_prompt_block(self.session_profile)}
+
+Constraints:
+- Do not print credentials or persist credential values.
+- Finish only after the output file exists and contains the requested data or a clear structured blocker report.
+"""
+
+
+class GeneratedCodeScrapeDiscovery(AutomatedScrapeDiscovery):
+    run_mode = "generated_code_discovery"
+    log_suffix = "generated_code_discovery"
+    status_prefix_suffix = "generated_code_discovery"
+    task_title = "Generated-code discovery scrape agent"
+    summary_title = "# Generated-Code Discovery Summary"
+
+    @property
+    def generated_code_dir(self) -> Path:
+        return self.run_dir / "generated-code-workspace"
+
+    def _prepare_run_dir(self) -> None:
+        self.generated_code_dir.mkdir(parents=True, exist_ok=True)
+        super()._prepare_run_dir()
+
+    def _request_metadata_extras(self) -> dict[str, Any]:
+        return {
+            "generated_code_dir": str(self.generated_code_dir),
+            "generated_code_cleanup": "host_removes_generated_code_dir_after_agent_process",
+        }
+
+    def _analytics_extras(self) -> dict[str, Any]:
+        return {
+            "generated_code_dir": str(self.generated_code_dir),
+            "generated_code_dir_exists_after_cleanup": self.generated_code_dir.exists(),
+        }
+
+    def _post_agent_cleanup_action(self):
+        return self._cleanup_generated_code_dir
+
+    def _cleanup_generated_code_dir(self) -> None:
+        if self.generated_code_dir.exists():
+            shutil.rmtree(self.generated_code_dir)
+
+    def _build_scrape_prompt(self, redacted: bool) -> str:
+        return f"""You are running a generated-code scraping task for MCP-PW-SCRAPPER.
+
+The user asked for this scrape goal:
+{self.user_prompt}
+
+Source URL:
+{self.source_url}
+
+Output file:
+{self.output_path.resolve()}
+
+Output format:
+{self.output_format}
+
+Run artifacts directory:
+{self.run_dir.resolve()}
+
+Diagnostics directory:
+{self.diagnostics_dir.resolve()}
+
+Temporary generated-code workspace:
+{self.generated_code_dir.resolve()}
+
+Core workflow:
+- Use Playwright MCP/browser MCP first to inspect and understand the live page structure, pagination/lazy-loading behavior, blockers, and the data shape needed by the user.
+- After inspecting the page, write a disposable scraper script under the temporary generated-code workspace above.
+- The generated script must perform the scraping and transformation work itself. It should open the source URL, collect the requested data, normalize it into the requested output format, and write the final result to the exact output file above.
+- Execute the generated script from this run. Do not manually assemble or rewrite the final output outside the script except to create a clear structured blocker report if code execution cannot proceed.
+- Delete generated source code and other temporary code files after the script has run. The host process will also remove the temporary generated-code workspace after your process exits.
+- Do not create scraper source code outside the temporary generated-code workspace.
+- Do not modify repository source files.
+- Save the final scraped result to the exact output file above.
+- Save supporting diagnostics only under the diagnostics directory, for example page notes, screenshots, or raw observations.
+- If the run is blocked, partial because of an error/limitation, hits login/OTP/CAPTCHA/anti-bot, or sees repeated navigation/pagination failure, capture a screenshot if the browser MCP exposes screenshot support and save it under the diagnostics directory with a descriptive filename.
+- When a page action triggers lazy loading, pagination, or an infinite-scroll spinner, the generated script should wait for the loading indicator to disappear, the target data count to change, or a clearly stated timeout before deciding that no new data appeared.
+
+JSON output rules:
+- When the requested output format is JSON, write a JSON object.
+- Prefer this shape unless the user explicitly requested a different schema:
+  {{
+    "source_url": "...",
+    "user_prompt": "...",
+    "items": [
+      {{ "...": "..." }}
+    ],
+    "meta": {{
+      "mode": "generated_code_discovery",
+      "generated_script_executed": true
+    }}
+  }}
+- Include stable field names based on the user's request.
+- Keep useful original text fields, and normalize obvious numbers/dates/URLs when it is safe.
+
+Script/tooling guidance:
+- Prefer Python with the installed Playwright package when practical.
+- Keep the generated script self-contained and deterministic for this specific scrape goal.
+- The script may read environment variables only when needed for credentials described below.
+- The script must not print credentials or persist credential values.
+- The script should close browser/context/page objects when complete.
+- If Playwright MCP is not available for the initial inspection, stop and report that browser MCP is required for generated-code discovery.
+- If local browser automation cannot launch from the generated script, write a structured blocker report to the output file and include the script/runtime error in diagnostics without exposing secrets.
+
+Browser behavior constraints:
+- You are running unattended from the host process; do not ask the user to approve MCP/tool calls.
+- Prefer low-noise browser operations: navigate once, use DOM inspection/evaluate for extraction, and avoid opening product pages unless the user prompt explicitly requires product-detail data.
+- Do not browse freely, compare unrelated pages, add items to cart, sign in, change account settings, or perform actions unrelated to collecting the requested fields.
+- If a CAPTCHA, OTP, anti-bot challenge, login failure, repeated pagination failure, or unavailable page appears, do not bypass it. Save useful diagnostics under the diagnostics directory and report the blocker or limitation in the output.
 
 Credential instructions:
 {credentials_prompt_block(self.credentials, redacted=redacted)}

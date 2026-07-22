@@ -1,0 +1,45 @@
+{
+  "name": "books",
+  "kind": "folder_etl",
+  "source_url": "https://books.toscrape.com/",
+  "files": [
+    "main.py",
+    "etl.py",
+    "settings.py",
+    "extractor/books.py",
+    "transformer/books.py",
+    "validator/books.py",
+    "schema/books.py"
+  ],
+  "allowed_paths": [
+    "etl.py",
+    "settings.py",
+    "extractor/books.py",
+    "transformer/books.py",
+    "validator/books.py",
+    "schema/books.py"
+  ],
+  "run_command": [
+    "uv",
+    "run",
+    "python",
+    "-m",
+    "scrapers.books.main",
+    "run",
+    "--quiet",
+    "--browser",
+    "playwright"
+  ],
+  "verification_command": [
+    "uv",
+    "run",
+    "python",
+    "-m",
+    "scrapers.books.main",
+    "run",
+    "--quiet",
+    "--browser",
+    "playwright"
+  ],
+  "output_path": "output/scrapers/books/output.json"
+}
